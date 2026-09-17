@@ -15,13 +15,14 @@ from .availability import (
     busy_intervals,
     common_free_slots,
 )
-from .expander import ExpansionError, expand_calendar
+from .diff import CalendarDiff, diff_calendars
+from .expander import ExpansionError, Instance, expand_calendar
 
 UTC = dt.timezone.utc
 
 app = FastAPI(
     title="iCalendar Recurrence Expansion and Availability API",
-    version="1.1.0",
+    version="1.2.0",
     summary="Expand DTSTART/RRULE/RDATE/EXDATE and RECURRENCE-ID overrides "
     "into concrete UTC instances, and intersect named calendars with "
     "local working hours to find common free time.",
@@ -160,6 +161,52 @@ class AvailabilityResponse(BaseModel):
         return _iso_z(value)
 
 
+def _instance_out(instance: Instance) -> InstanceOut:
+    return InstanceOut(
+        uid=instance.uid,
+        recurrence_id=instance.recurrence_id,
+        summary=instance.summary,
+        start=instance.start,
+        end=instance.end,
+        status=instance.status,
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /calendar-diff
+# ---------------------------------------------------------------------------
+
+
+class CalendarDiffRequest(BaseModel):
+    old_ics: str = Field(..., description="Old version of the iCalendar text")
+    new_ics: str = Field(..., description="New version of the iCalendar text")
+    window_start: dt.datetime = Field(
+        ..., description="Start of the shared query window (ISO 8601, UTC)"
+    )
+    window_end: dt.datetime = Field(
+        ..., description="End of the shared query window (ISO 8601, UTC)"
+    )
+
+
+class ModifiedInstanceOut(BaseModel):
+    """One identity present on both sides whose content changed."""
+
+    before: InstanceOut
+    after: InstanceOut
+
+
+class CalendarDiffResponse(BaseModel):
+    window_start: dt.datetime
+    window_end: dt.datetime
+    added: list[InstanceOut]
+    removed: list[InstanceOut]
+    modified: list[ModifiedInstanceOut]
+
+    @field_serializer("window_start", "window_end")
+    def _serialize_window(self, value: dt.datetime) -> str:
+        return _iso_z(value)
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -181,16 +228,35 @@ def expand(request: ExpandRequest) -> ExpandResponse:
         window_start=window_start,
         window_end=window_end,
         count=len(instances),
-        instances=[
-            InstanceOut(
-                uid=i.uid,
-                recurrence_id=i.recurrence_id,
-                summary=i.summary,
-                start=i.start,
-                end=i.end,
-                status=i.status,
+        instances=[_instance_out(i) for i in instances],
+    )
+
+
+@app.post("/calendar-diff", response_model=CalendarDiffResponse)
+def calendar_diff(request: CalendarDiffRequest) -> CalendarDiffResponse:
+    window_start = _to_utc(request.window_start)
+    window_end = _to_utc(request.window_end)
+    if window_start >= window_end:
+        raise HTTPException(
+            status_code=422, detail="window_start must be before window_end"
+        )
+    try:
+        diff: CalendarDiff = diff_calendars(
+            request.old_ics, request.new_ics, window_start, window_end
+        )
+    except ExpansionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return CalendarDiffResponse(
+        window_start=window_start,
+        window_end=window_end,
+        added=[_instance_out(i) for i in diff.added],
+        removed=[_instance_out(i) for i in diff.removed],
+        modified=[
+            ModifiedInstanceOut(
+                before=_instance_out(before),
+                after=_instance_out(after),
             )
-            for i in instances
+            for before, after in diff.modified
         ],
     )
 

@@ -13,6 +13,9 @@ local working hours.
 - `/availability` builds working hours per **local date** (DST-correct),
   clips all busy instances to them, merges half-open intervals (adjacent
   included), and returns the complement shared by every calendar
+- `/calendar-diff` compares two ICS versions over one UTC window by
+  `UID + RECURRENCE-ID` and returns identity-sorted `added`/`removed`/
+  `modified` instances (with `before`/`after`)
 - Results sorted by UTC start time, then `UID` (stable)
 - Clear `422` errors for invalid rules, unknown timezones, or bad input
 
@@ -157,6 +160,102 @@ because the minimum length is inclusive:
 }
 ```
 
+### `POST /calendar-diff`
+
+Compares an **old** and a **new** version of a calendar over one shared UTC
+window. Both ICS texts are expanded with the same recurrence engine used by
+`/expand`; instance identity is fixed to `UID + RECURRENCE-ID` for recurring
+instances and to `UID` alone for non-recurring events (`recurrence_id` is
+`null`). Only instances that overlap the common window take part in the
+comparison.
+
+| Field          | Type   | Description                                         |
+| -------------- | ------ | --------------------------------------------------- |
+| `old_ics`      | string | Old version of the iCalendar text                   |
+| `new_ics`      | string | New version of the iCalendar text                   |
+| `window_start` | string | Shared ISO 8601 window start, converted to UTC      |
+| `window_end`   | string | Shared ISO 8601 window end, converted to UTC        |
+
+The response lists:
+
+- `added` — identities present only in the new calendar,
+- `removed` — identities present only in the old calendar,
+- `modified` — identities present on both sides whose `start`, `end`,
+  `summary` or `status` changed, each with a `before` and an `after` object
+  in the same shape as an `/expand` instance.
+
+Completely identical instances are not returned. All three lists are sorted
+by identity (`UID`, then `RECURRENCE-ID`; a `null` `RECURRENCE-ID` sorts
+first). Cancelling an occurrence with a `STATUS:CANCELLED` override makes it
+disappear from the expansion, so it is reported as `removed`; likewise an
+instance rescheduled across the window boundary appears as
+`removed`/`added`, while one that still overlaps the window on both sides is
+`modified` (its identity never changes).
+
+### Example
+
+```bash
+curl -s http://localhost:8000/calendar-diff \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "old_ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:standup\r\nDTSTART:20260302T090000Z\r\nDTEND:20260302T091500Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\nSUMMARY:Standup\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:oneoff\r\nDTSTART:20260304T140000Z\r\nDTEND:20260304T150000Z\r\nSUMMARY:Old review\r\nEND:VEVENT\r\nEND:VCALENDAR",
+    "new_ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:standup\r\nDTSTART:20260302T090000Z\r\nDTEND:20260302T091500Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\nSUMMARY:Standup\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:standup\r\nRECURRENCE-ID:20260309T090000Z\r\nDTSTART:20260309T100000Z\r\nDTEND:20260309T101500Z\r\nSUMMARY:Standup (15 min later)\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:workshop\r\nDTSTART:20260320T130000Z\r\nDTEND:20260320T150000Z\r\nSUMMARY:Workshop\r\nEND:VEVENT\r\nEND:VCALENDAR",
+    "window_start": "2026-03-01T00:00:00Z",
+    "window_end": "2026-04-01T00:00:00Z"
+  }'
+```
+
+The new calendar adds `workshop`, drops `oneoff`, and moves the March 9
+standup instance (its `RECURRENCE-ID` stays `2026-03-09T09:00:00Z`); the
+unchanged March 2/16/23 standups are not reported:
+
+```json
+{
+  "window_start": "2026-03-01T00:00:00Z",
+  "window_end": "2026-04-01T00:00:00Z",
+  "added": [
+    {
+      "uid": "workshop",
+      "recurrence_id": null,
+      "summary": "Workshop",
+      "start": "2026-03-20T13:00:00Z",
+      "end": "2026-03-20T15:00:00Z",
+      "status": "CONFIRMED"
+    }
+  ],
+  "removed": [
+    {
+      "uid": "oneoff",
+      "recurrence_id": null,
+      "summary": "Old review",
+      "start": "2026-03-04T14:00:00Z",
+      "end": "2026-03-04T15:00:00Z",
+      "status": "CONFIRMED"
+    }
+  ],
+  "modified": [
+    {
+      "before": {
+        "uid": "standup",
+        "recurrence_id": "2026-03-09T09:00:00Z",
+        "summary": "Standup",
+        "start": "2026-03-09T09:00:00Z",
+        "end": "2026-03-09T09:15:00Z",
+        "status": "CONFIRMED"
+      },
+      "after": {
+        "uid": "standup",
+        "recurrence_id": "2026-03-09T09:00:00Z",
+        "summary": "Standup (15 min later)",
+        "start": "2026-03-09T10:00:00Z",
+        "end": "2026-03-09T10:15:00Z",
+        "status": "CONFIRMED"
+      }
+    }
+  ]
+}
+```
+
 ### Errors (`422 Unprocessable Entity`)
 
 Returned with a descriptive `detail` message for: unparsable iCalendar
@@ -169,6 +268,10 @@ expansions exceeding 10 000 occurrences per UID within the window.
 (non-IANA name), a working period with `end <= start` or crossing
 midnight, an offset-bearing working time, an unknown weekday key, and a
 non-positive `minimum_minutes`.
+
+`/calendar-diff` reuses the same calendar and window validation, so it
+returns `422` when `window_start >= window_end` or when either `old_ics` or
+`new_ics` fails any of the `/expand` checks above.
 
 ## Semantics and limitations
 
@@ -220,10 +323,12 @@ uvicorn app.main:app --reload       # run locally on port 8000
 ## Project layout
 
 ```
-app/main.py          FastAPI app: POST /expand, POST /availability, GET /health
+app/main.py          FastAPI app: POST /expand, POST /calendar-diff,
+                     POST /availability, GET /health
 app/expander.py      recurrence expansion, override merging, TZ/DST handling
+app/diff.py          two-calendar instance diff by UID + RECURRENCE-ID
 app/availability.py  working-period timeline, busy clipping/merge, free complement
-tests/               key tests for both endpoints (recurrences, DST, 422s)
+tests/               key tests for all endpoints (recurrences, DST, 422s)
 Dockerfile           python:3.12-slim image running uvicorn on port 8000
 docker-compose.yml   single-command startup
 ```

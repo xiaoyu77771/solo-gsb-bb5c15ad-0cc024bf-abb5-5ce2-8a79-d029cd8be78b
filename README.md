@@ -1,9 +1,10 @@
 # iCalendar Recurrence Expansion & Availability API
 
 A local HTTP API that expands iCalendar (RFC 5545) recurring events into
-concrete UTC instances inside a query window, and finds the **common free
+concrete UTC instances inside a query window, finds the **common free
 time** across several named calendars when intersected with per-weekday
-local working hours.
+local working hours, and **diffs two revisions** of a calendar within one
+query window.
 
 - Expands `DTSTART` + `RRULE` + `RDATE` − `EXDATE`
 - Merges overrides by `UID` + `RECURRENCE-ID`: an override can **reschedule**
@@ -13,12 +14,17 @@ local working hours.
 - `/availability` builds working hours per **local date** (DST-correct),
   clips all busy instances to them, merges half-open intervals (adjacent
   included), and returns the complement shared by every calendar
+- `/calendar-diff` expands an old and a new calendar revision in the same
+  UTC window and reports instances as `added`, `removed`, or `modified`
+  (with before/after), keyed by `UID` + `RECURRENCE-ID`
 - Results sorted by UTC start time, then `UID` (stable)
 - Clear `422` errors for invalid rules, unknown timezones, or bad input
 
 Stack: Python · FastAPI · icalendar · python-dateutil · zoneinfo
 
 ## Quick start (Docker Compose)
+
+Single command to build and start the service:
 
 ```bash
 docker compose up --build
@@ -157,6 +163,99 @@ because the minimum length is inclusive:
 }
 ```
 
+### `POST /calendar-diff`
+
+Compares two revisions of a calendar. Both ICS texts are expanded with the
+same recurrence engine inside one shared UTC query window, and the
+resulting instances are matched by identity: `UID` + `RECURRENCE-ID` for
+recurring instances, `UID` alone for non-recurring events. Request body:
+
+| Field          | Type   | Description                                        |
+| -------------- | ------ | -------------------------------------------------- |
+| `old_ics`      | string | iCalendar text of the old revision                 |
+| `new_ics`      | string | iCalendar text of the new revision                 |
+| `window_start` | string | ISO 8601 timestamp, converted to UTC (naive = UTC) |
+| `window_end`   | string | ISO 8601 timestamp, converted to UTC (naive = UTC) |
+
+The response carries three lists, each sorted by identity (`UID`, then
+`RECURRENCE-ID`):
+
+- `added` — instances whose identity exists only in the new revision
+- `removed` — instances whose identity exists only in the old revision
+  (e.g. an occurrence cancelled via a `STATUS:CANCELLED` override)
+- `modified` — instances present in both revisions where `start`, `end`,
+  `summary`, or `status` changed; each entry carries the full `before`
+  and `after` instance
+
+Instances identical in both revisions are not returned. Only instances
+overlapping the window are compared, so changes outside the window do not
+appear. Note that a rescheduled recurring instance keeps its identity
+(`RECURRENCE-ID` follows the original slot), so it shows up as `modified`
+with different `start`/`end` — not as a remove/add pair.
+
+### Example
+
+```bash
+curl -s http://localhost:8000/calendar-diff \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "old_ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:weekly-1\r\nDTSTART:20260302T090000Z\r\nDTEND:20260302T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=2\r\nSUMMARY:Weekly sync\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:one-off-1\r\nDTSTART:20260304T150000Z\r\nDTEND:20260304T160000Z\r\nSUMMARY:Review\r\nEND:VEVENT\r\nEND:VCALENDAR",
+    "new_ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:weekly-1\r\nDTSTART:20260302T090000Z\r\nDTEND:20260302T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=2\r\nSUMMARY:Weekly sync\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:weekly-1\r\nRECURRENCE-ID:20260309T090000Z\r\nDTSTART:20260309T110000Z\r\nDTEND:20260309T120000Z\r\nSUMMARY:Weekly sync (moved)\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:one-off-2\r\nDTSTART:20260305T150000Z\r\nDTEND:20260305T160000Z\r\nSUMMARY:Planning\r\nEND:VEVENT\r\nEND:VCALENDAR",
+    "window_start": "2026-03-01T00:00:00Z",
+    "window_end": "2026-04-01T00:00:00Z"
+  }'
+```
+
+The March 9 occurrence was rescheduled (same `RECURRENCE-ID`, new time),
+`one-off-1` disappeared and `one-off-2` is new:
+
+```json
+{
+  "window_start": "2026-03-01T00:00:00Z",
+  "window_end": "2026-04-01T00:00:00Z",
+  "added": [
+    {
+      "uid": "one-off-2",
+      "recurrence_id": null,
+      "summary": "Planning",
+      "start": "2026-03-05T15:00:00Z",
+      "end": "2026-03-05T16:00:00Z",
+      "status": "CONFIRMED"
+    }
+  ],
+  "removed": [
+    {
+      "uid": "one-off-1",
+      "recurrence_id": null,
+      "summary": "Review",
+      "start": "2026-03-04T15:00:00Z",
+      "end": "2026-03-04T16:00:00Z",
+      "status": "CONFIRMED"
+    }
+  ],
+  "modified": [
+    {
+      "before": {
+        "uid": "weekly-1",
+        "recurrence_id": "2026-03-09T09:00:00Z",
+        "summary": "Weekly sync",
+        "start": "2026-03-09T09:00:00Z",
+        "end": "2026-03-09T10:00:00Z",
+        "status": "CONFIRMED"
+      },
+      "after": {
+        "uid": "weekly-1",
+        "recurrence_id": "2026-03-09T09:00:00Z",
+        "summary": "Weekly sync (moved)",
+        "start": "2026-03-09T11:00:00Z",
+        "end": "2026-03-09T12:00:00Z",
+        "status": "CONFIRMED"
+      }
+    }
+  ]
+}
+```
+
 ### Errors (`422 Unprocessable Entity`)
 
 Returned with a descriptive `detail` message for: unparsable iCalendar
@@ -169,6 +268,10 @@ expansions exceeding 10 000 occurrences per UID within the window.
 (non-IANA name), a working period with `end <= start` or crossing
 midnight, an offset-bearing working time, an unknown weekday key, and a
 non-positive `minimum_minutes`.
+
+`/calendar-diff` applies the same `422` semantics: either calendar being
+invalid, or `window_start >= window_end`, produces a `422` with a
+descriptive `detail` message.
 
 ## Semantics and limitations
 
@@ -220,10 +323,11 @@ uvicorn app.main:app --reload       # run locally on port 8000
 ## Project layout
 
 ```
-app/main.py          FastAPI app: POST /expand, POST /availability, GET /health
+app/main.py          FastAPI app: POST /expand, POST /availability, POST /calendar-diff, GET /health
 app/expander.py      recurrence expansion, override merging, TZ/DST handling
 app/availability.py  working-period timeline, busy clipping/merge, free complement
-tests/               key tests for both endpoints (recurrences, DST, 422s)
+app/diff.py          identity-keyed comparison of two expanded calendars
+tests/               key tests for all endpoints (recurrences, DST, diff, 422s)
 Dockerfile           python:3.12-slim image running uvicorn on port 8000
 docker-compose.yml   single-command startup
 ```

@@ -15,16 +15,18 @@ from .availability import (
     busy_intervals,
     common_free_slots,
 )
-from .expander import ExpansionError, expand_calendar
+from .diff import diff_instances
+from .expander import ExpansionError, Instance, expand_calendar
 
 UTC = dt.timezone.utc
 
 app = FastAPI(
     title="iCalendar Recurrence Expansion and Availability API",
-    version="1.1.0",
+    version="1.2.0",
     summary="Expand DTSTART/RRULE/RDATE/EXDATE and RECURRENCE-ID overrides "
-    "into concrete UTC instances, and intersect named calendars with "
-    "local working hours to find common free time.",
+    "into concrete UTC instances, intersect named calendars with local "
+    "working hours to find common free time, and diff two calendar "
+    "revisions within one query window.",
 )
 
 
@@ -72,6 +74,17 @@ class ExpandResponse(BaseModel):
     @field_serializer("window_start", "window_end")
     def _serialize_window(self, value: dt.datetime) -> str:
         return _iso_z(value)
+
+
+def _instance_out(i: Instance) -> InstanceOut:
+    return InstanceOut(
+        uid=i.uid,
+        recurrence_id=i.recurrence_id,
+        summary=i.summary,
+        start=i.start,
+        end=i.end,
+        status=i.status,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -181,17 +194,7 @@ def expand(request: ExpandRequest) -> ExpandResponse:
         window_start=window_start,
         window_end=window_end,
         count=len(instances),
-        instances=[
-            InstanceOut(
-                uid=i.uid,
-                recurrence_id=i.recurrence_id,
-                summary=i.summary,
-                start=i.start,
-                end=i.end,
-                status=i.status,
-            )
-            for i in instances
-        ],
+        instances=[_instance_out(i) for i in instances],
     )
 
 
@@ -234,5 +237,65 @@ def availability(request: AvailabilityRequest) -> AvailabilityResponse:
                 minutes=int((end - start).total_seconds() // 60),
             )
             for start, end in slots
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /calendar-diff
+# ---------------------------------------------------------------------------
+
+
+class CalendarDiffRequest(BaseModel):
+    old_ics: str = Field(..., description="iCalendar text of the old revision")
+    new_ics: str = Field(..., description="iCalendar text of the new revision")
+    window_start: dt.datetime = Field(
+        ..., description="Start of the query window (ISO 8601, converted to UTC)"
+    )
+    window_end: dt.datetime = Field(
+        ..., description="End of the query window (ISO 8601, converted to UTC)"
+    )
+
+
+class ModifiedOut(BaseModel):
+    before: InstanceOut
+    after: InstanceOut
+
+
+class CalendarDiffResponse(BaseModel):
+    window_start: dt.datetime
+    window_end: dt.datetime
+    added: list[InstanceOut]
+    removed: list[InstanceOut]
+    modified: list[ModifiedOut]
+
+    @field_serializer("window_start", "window_end")
+    def _serialize_window(self, value: dt.datetime) -> str:
+        return _iso_z(value)
+
+
+@app.post("/calendar-diff", response_model=CalendarDiffResponse)
+def calendar_diff(request: CalendarDiffRequest) -> CalendarDiffResponse:
+    window_start = _to_utc(request.window_start)
+    window_end = _to_utc(request.window_end)
+    if window_start >= window_end:
+        raise HTTPException(
+            status_code=422, detail="window_start must be before window_end"
+        )
+    try:
+        old_instances = expand_calendar(request.old_ics, window_start, window_end)
+        new_instances = expand_calendar(request.new_ics, window_start, window_end)
+    except ExpansionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    added, removed, modified = diff_instances(old_instances, new_instances)
+    return CalendarDiffResponse(
+        window_start=window_start,
+        window_end=window_end,
+        added=[_instance_out(i) for i in added],
+        removed=[_instance_out(i) for i in removed],
+        modified=[
+            ModifiedOut(before=_instance_out(m.before), after=_instance_out(m.after))
+            for m in modified
         ],
     )
